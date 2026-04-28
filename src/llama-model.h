@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-model-loader.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -16,7 +17,6 @@
 
 struct llama_cparams;
 struct llama_ubatch;
-struct llama_model_loader;
 
 // available models
 enum llm_type {
@@ -496,6 +496,9 @@ struct llama_model {
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
+
+    // tensor name -> LBA mapping used by the AiF SSD path
+    std::unordered_map<std::string, llama_aif_lba_info> aif_tensor_table;
 
     // list of devices used in this model
     std::vector<ggml_backend_dev_t> devices;

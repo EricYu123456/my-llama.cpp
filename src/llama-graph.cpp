@@ -871,7 +871,60 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    const char * wname = ggml_get_name(w);
+    const bool is_decode_phase = n_tokens == 1;
+
+    bool weight_on_aif = false;
+    if (w->buffer != nullptr) {
+        ggml_backend_buffer_type_t w_buft = ggml_backend_buffer_get_type(w->buffer);
+        weight_on_aif = w_buft != nullptr && strcmp(ggml_backend_buft_name(w_buft), "AIF") == 0;
+    }
+
+    ggml_backend_t backend_aif = nullptr;
+    if (sched != nullptr && is_decode_phase) {
+        const int n_backends = ggml_backend_sched_get_n_backends(sched);
+        for (int i = 0; i < n_backends; ++i) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            if (b != nullptr && strcmp(ggml_backend_name(b), "AIF") == 0) {
+                backend_aif = b;
+                break;
+            }
+        }
+    }
+
+    const bool split_ffn_down =
+        is_decode_phase &&
+        weight_on_aif &&
+        backend_aif != nullptr &&
+        wname != nullptr &&
+        strstr(wname, ".ffn_down.weight") != nullptr &&
+        (!loras || loras->empty()) &&
+        w->ne[1] >= 2;
+
+    ggml_tensor * res = nullptr;
+    if (split_ffn_down) {
+        const int64_t left_rows = w->ne[1] / 2;
+        const int64_t right_rows = w->ne[1] - left_rows;
+
+        ggml_tensor * w_host = ggml_view_2d(ctx0, w, w->ne[0], left_rows, w->nb[1], 0);
+        ggml_tensor * w_aif  = ggml_view_2d(ctx0, w, w->ne[0], right_rows, w->nb[1], left_rows * w->nb[1]);
+
+        ggml_tensor * res_host = ggml_mul_mat(ctx0, w_host, cur);
+        ggml_tensor * res_aif  = ggml_mul_mat(ctx0, w_aif, cur);
+
+        if (sched != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, res_host, backend_cpu);
+            ggml_backend_sched_set_tensor_backend(sched, res_aif, backend_aif);
+        }
+
+        res = ggml_concat(ctx0, res_host, res_aif, 0);
+        if (sched != nullptr) {
+            // Aggregate split FFN outputs on host before feeding the next block.
+            ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
+        }
+    } else {
+        res = ggml_mul_mat(ctx0, w, cur);
+    }
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -889,6 +942,28 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
+    }
+
+    if (sched != nullptr) {
+        if (!is_decode_phase) {
+            // Prefill is pinned to host execution.
+            ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
+        } else if (backend_aif != nullptr && wname != nullptr) {
+            const bool is_qkv_proj =
+                strstr(wname, ".attn_q.weight") != nullptr ||
+                strstr(wname, ".attn_k.weight") != nullptr ||
+                strstr(wname, ".attn_v.weight") != nullptr ||
+                strstr(wname, ".attn_qkv.weight") != nullptr;
+
+            const bool is_mha_path =
+                strstr(wname, ".attn_out.weight") != nullptr;
+
+            if (is_qkv_proj && weight_on_aif) {
+                ggml_backend_sched_set_tensor_backend(sched, res, backend_aif);
+            } else if (is_mha_path) {
+                ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
+            }
+        }
     }
 
     return res;
@@ -1795,10 +1870,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
 
-        if (!cparams.offload_kqv) {
-            // all nodes between the KV store and the attention output are run on the CPU
-            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
-        }
+        // Keep KV-cache dependent MHA work on host.
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
     }
 
     ggml_build_forward_expand(gf, cur);

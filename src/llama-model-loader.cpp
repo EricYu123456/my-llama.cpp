@@ -1,16 +1,21 @@
 #include "llama-model-loader.h"
 
 #include "ggml.h"
+#include "ggml-aif-nvme.h"
 
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdlib>
+#include <fcntl.h>
 #include <cstring>
 #include <future>
+#include <unistd.h>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+static const uint64_t AIF_BLOCK_SIZE = 4096;
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -521,6 +526,31 @@ llama_model_loader::llama_model_loader(
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
+    if (const char * aif_env = getenv("LLAMA_AIF_ENABLE")) {
+        aif_enabled = atoi(aif_env) != 0;
+    }
+    if (aif_enabled) {
+        const bool aif_fake_post = ggml_aif_nvme_fake_mode_enabled();
+        const char * dev_path = getenv("GGML_AIF_NVME_PATH");
+        if (dev_path == nullptr || dev_path[0] == '\0') {
+            dev_path = "/dev/nvme0n1";
+        }
+
+        if (const char * start_lba_env = getenv("LLAMA_AIF_START_LBA")) {
+            aif_next_lba = strtoull(start_lba_env, nullptr, 10);
+        }
+
+        if (aif_fake_post) {
+            LLAMA_LOG_INFO("%s: GGML_AIF_FAKE_POST enabled, skipping NVMe device open and using fake POST path\n", __func__);
+        } else {
+            aif_fd = open(dev_path, O_RDWR | O_CLOEXEC);
+            if (aif_fd < 0) {
+                LLAMA_LOG_WARN("%s: failed to open AIF NVMe device %s, disabling AIF path\n", __func__, dev_path);
+                aif_enabled = false;
+            }
+        }
+    }
+
     // Load the main GGUF
     struct ggml_context * ctx = NULL;
     struct gguf_init_params params = {
@@ -765,6 +795,13 @@ llama_model_loader::llama_model_loader(
     this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
+}
+
+llama_model_loader::~llama_model_loader() {
+    if (aif_fd >= 0) {
+        close(aif_fd);
+        aif_fd = -1;
+    }
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1077,6 +1114,8 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    bool warned_fake_gemv_no_mmap = false;
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1091,6 +1130,71 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        bool is_aif_tensor = false;
+        if (cur->buffer != nullptr) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(cur->buffer);
+            if (buft != nullptr && strcmp(ggml_backend_buft_name(buft), "AIF") == 0) {
+                is_aif_tensor = true;
+            }
+        }
+
+        if (is_aif_tensor && aif_enabled) {
+            const void * src_ptr = nullptr;
+
+            if (use_mmap) {
+                const auto & mapping = mappings.at(weight->idx);
+                src_ptr = (uint8_t *) mapping->addr() + weight->offs;
+            } else {
+                read_buf.resize(n_size);
+                const auto & file = files.at(weight->idx);
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(read_buf.data(), n_size);
+                src_ptr = read_buf.data();
+            }
+
+            const uint64_t start_lba = aif_next_lba;
+            const uint32_t nblocks = (uint32_t) ((n_size + AIF_BLOCK_SIZE - 1) / AIF_BLOCK_SIZE);
+
+            struct ggml_aif_post_args post_args = {
+                /* .rows      = */ (uint32_t) cur->ne[1],
+                /* .cols      = */ (uint32_t) cur->ne[0],
+                /* .host_addr = */ src_ptr,
+                /* .nbytes    = */ n_size,
+                /* .start_lba = */ start_lba,
+                /* .nblocks   = */ nblocks,
+            };
+
+            if (nvme_submit_aif_post(aif_fd, &post_args) != 0) {
+                throw std::runtime_error(format("failed to post tensor '%s' to AIF NVMe", ggml_get_name(cur)));
+            }
+
+            aif_tensor_table[ggml_get_name(cur)] = llama_aif_lba_info {
+                /* .start_lba = */ start_lba,
+                /* .nblocks   = */ nblocks,
+            };
+
+            if (ggml_aif_nvme_fake_gemv_enabled()) {
+                if (use_mmap) {
+                    // In fake GEMV mode keep the mmap source pointer so software fallback can read weights.
+                    cur->data = (void *) src_ptr;
+                } else if (!warned_fake_gemv_no_mmap) {
+                    LLAMA_LOG_WARN("%s: GGML_AIF_FAKE_GEMV without mmap may not preserve AIF weight sources for fallback GEMV\n", __func__);
+                    warned_fake_gemv_no_mmap = true;
+                    // Store a non-null logical offset in tensor->data for the AIF backend.
+                    // +1 keeps LBA decoding stable via integer division while avoiding null pointers at LBA 0.
+                    cur->data = (void *) (uintptr_t) (start_lba * AIF_BLOCK_SIZE + 1);
+                }
+            } else {
+                // Store a non-null logical offset in tensor->data for the AIF backend.
+                // +1 keeps LBA decoding stable via integer division while avoiding null pointers at LBA 0.
+                cur->data = (void *) (uintptr_t) (start_lba * AIF_BLOCK_SIZE + 1);
+            }
+            aif_next_lba += nblocks;
+
+            size_done += n_size;
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);

@@ -70,6 +70,10 @@
 #include "ggml-rpc.h"
 #endif
 
+#ifdef GGML_USE_AIF
+#include "ggml-aif.h"
+#endif
+
 #ifdef GGML_USE_VIRTGPU_FRONTEND
 #include "ggml-virtgpu.h"
 #endif
@@ -153,6 +157,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_RPC
         register_backend(ggml_backend_rpc_reg());
+#endif
+#ifdef GGML_USE_AIF
+    register_backend(ggml_backend_aif_reg());
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());

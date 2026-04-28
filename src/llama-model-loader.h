@@ -23,6 +23,11 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+struct llama_aif_lba_info {
+    uint64_t start_lba = 0;
+    uint32_t nblocks   = 0;
+};
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
@@ -94,6 +99,11 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    bool aif_enabled = false;
+    int aif_fd = -1;
+    uint64_t aif_next_lba = 0;
+    std::unordered_map<std::string, llama_aif_lba_info> aif_tensor_table;
+
     llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
@@ -103,6 +113,8 @@ struct llama_model_loader {
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+
+    ~llama_model_loader();
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

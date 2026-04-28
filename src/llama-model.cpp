@@ -7707,6 +7707,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    aif_tensor_table = ml.aif_tensor_table;
+
     if (ml.no_alloc) {
         return true;
     }

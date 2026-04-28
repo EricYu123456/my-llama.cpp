@@ -1,0 +1,1 @@
+./build/bin/llama-cli -m qwen2-57b-a14b-instruct-q3_k_m.gguf -n 0 -p "test"

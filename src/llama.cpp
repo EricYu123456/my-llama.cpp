@@ -14,6 +14,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cinttypes>
 #include <cstddef>
@@ -832,6 +833,54 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     time_meas tm(model.t_load_us);
 
     model.t_start_us = tm.t_start_us;
+
+    std::vector<llama_model_tensor_buft_override> aif_overrides_merged;
+    const char * aif_env = getenv("LLAMA_AIF_ENABLE");
+    const bool aif_enabled = aif_env && atoi(aif_env) != 0;
+    if (aif_enabled) {
+        ggml_backend_buffer_type_t aif_buft = nullptr;
+
+        if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("AIF")) {
+            if (ggml_backend_reg_dev_count(reg) > 0) {
+                aif_buft = ggml_backend_dev_buffer_type(ggml_backend_reg_dev_get(reg, 0));
+            }
+        }
+
+        if (aif_buft != nullptr) {
+            size_t n_existing = 0;
+            if (params.tensor_buft_overrides != nullptr) {
+                for (const auto * p = params.tensor_buft_overrides; p->pattern != nullptr; ++p) {
+                    ++n_existing;
+                }
+            }
+
+            const size_t max_overrides = llama_max_tensor_buft_overrides();
+            const size_t n_required = n_existing + 2 + 1;
+            if (n_required <= max_overrides) {
+                aif_overrides_merged.reserve(n_required);
+
+                if (params.tensor_buft_overrides != nullptr) {
+                    for (const auto * p = params.tensor_buft_overrides; p->pattern != nullptr; ++p) {
+                        aif_overrides_merged.push_back(*p);
+                    }
+                }
+
+                aif_overrides_merged.push_back({"blk\\.[0-9]+\\.attn_(q|k|v|qkv)\\.weight", aif_buft});
+                aif_overrides_merged.push_back({"blk\\.[0-9]+\\.ffn_down\\.weight", aif_buft});
+                aif_overrides_merged.push_back({nullptr, nullptr});
+
+                params.tensor_buft_overrides = aif_overrides_merged.data();
+
+                LLAMA_LOG_INFO(
+                    "%s: AIF tensor override injection enabled (existing=%zu, merged=%zu)\n",
+                    __func__, n_existing, aif_overrides_merged.size() - 1);
+            } else {
+                LLAMA_LOG_WARN(
+                    "%s: skipping AIF tensor override injection, need %zu entries but max is %zu\n",
+                    __func__, n_required, max_overrides);
+            }
+        }
+    }
 
     try {
         llama_model_loader ml(fname, splits, params.use_mmap, params.use_direct_io, params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
