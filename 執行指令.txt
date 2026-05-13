@@ -1,7 +1,7 @@
+原始llama.cpp:
 ./build/bin/llama-cli -m qwen2-57b-a14b-instruct-q3_k_m.gguf -n 0 -p "test"
 
-測試aif_post:
-rm -f /tmp/aif_post.trace
+AiF 相關測試指令:
 
 A) Trace-only JSONL（不碰 NVMeVirt，CPU 正確輸出，會記錄 intended AIF 指令）
 rm -f /tmp/aif_trace.jsonl
