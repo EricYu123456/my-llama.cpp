@@ -1,1 +1,30 @@
 ./build/bin/llama-cli -m qwen2-57b-a14b-instruct-q3_k_m.gguf -n 0 -p "test"
+
+測試aif_post:
+rm -f /tmp/aif_post.trace
+
+A) Trace-only JSONL（不碰 NVMeVirt，CPU 正確輸出，會記錄 intended AIF 指令）
+rm -f /tmp/aif_trace.jsonl
+
+LLAMA_AIF_TRACE_ONLY=1 \
+GGML_AIF_TRACE_PATH=/tmp/aif_trace.jsonl \
+./build/bin/llama-cli -m qwen2-57b-a14b-instruct-q3_k_m.gguf \
+  -p "test" -n 32 --no-warmup -ngl 0 --mmap
+
+B) Fake AIF ioctl + 文字 log（不碰 NVMeVirt，會記錄假指令）
+rm -f /tmp/aif_fake.trace
+
+LLAMA_AIF_ENABLE=1 \
+GGML_AIF_FAKE_POST=1 \
+GGML_AIF_FAKE_GEMV=1 \
+GGML_AIF_FAKE_TRACE=/tmp/aif_fake.trace \
+LLAMA_AIF_START_LBA=0 \
+./build/bin/llama-cli -m qwen2-57b-a14b-instruct-q3_k_m.gguf \
+  -p "test" -n 32 --no-warmup -ngl 0 --mmap
+
+C) 真實 NVMeVirt（會送 ioctl，但目前沒有內建 log）
+LLAMA_AIF_ENABLE=1 \
+GGML_AIF_NVME_PATH=/dev/nvme0n1 \
+LLAMA_AIF_START_LBA=0 \
+./build/bin/llama-cli -m qwen2-57b-a14b-instruct-q3_k_m.gguf \
+  -p "test" -n 32 --no-warmup -ngl 0 --mmap

@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-model-loader.h"
 
 #include <cstdint>
 #include <vector>
@@ -11,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -529,6 +531,8 @@ struct llm_graph_params {
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
 
+    const std::unordered_map<std::string, llama_aif_lba_info> * aif_tensor_table;
+
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
@@ -736,6 +740,8 @@ struct llm_graph_context {
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+
+    const std::unordered_map<std::string, llama_aif_lba_info> * aif_tensor_table;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;

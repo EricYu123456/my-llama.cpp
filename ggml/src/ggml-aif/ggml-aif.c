@@ -183,6 +183,10 @@ static enum ggml_status ggml_backend_aif_buffer_init_tensor(ggml_backend_buffer_
         uintptr_t ptr = (uintptr_t) tensor->data;
         if (ptr >= ctx->base) {
             uintptr_t offs = ptr - ctx->base;
+            if (offs == 0) {
+                // Avoid NULL data pointers while keeping LBA decoding stable.
+                offs = 1;
+            }
             tensor->data = (void *) offs;
         }
     }
@@ -217,8 +221,7 @@ static void ggml_backend_aif_buffer_set_tensor(
         size_t size) {
     struct ggml_backend_aif_buffer_context * ctx = (struct ggml_backend_aif_buffer_context *) buffer->context;
 
-    if (ggml_aif_nvme_fake_gemv_enabled() &&
-        tensor->op == GGML_OP_NONE &&
+    if (tensor->op == GGML_OP_NONE &&
         tensor->view_src == NULL &&
         offset == 0 &&
         size == ggml_nbytes(tensor)) {
@@ -231,6 +234,8 @@ static void ggml_backend_aif_buffer_set_tensor(
             free(slot->data);
         }
 
+        // Keep a non-owning pointer to host data for scheduler copies without
+        // allocating large RAM for AIF weights.
         slot->data = (uint8_t *) data;
         slot->size = size;
         slot->owns_data = false;
@@ -257,24 +262,44 @@ static void ggml_backend_aif_buffer_get_tensor(
         size_t size) {
     struct ggml_backend_aif_buffer_context * ctx = (struct ggml_backend_aif_buffer_context *) buffer->context;
     struct ggml_backend_aif_tensor_store * slot = NULL;
+    const struct ggml_tensor * base_tensor = tensor;
+    size_t base_offset = 0;
+
     for (size_t i = 0; i < ctx->n_stores; ++i) {
         if (ctx->stores[i].tensor == tensor) {
             slot = &ctx->stores[i];
             break;
         }
     }
-    if (!slot || offset + size > slot->size) {
-        if (ggml_aif_nvme_fake_gemv_enabled() &&
-            tensor->data != NULL &&
-            ggml_backend_aif_ptr_is_probably_host(tensor->data)) {
-            memcpy(data, (const uint8_t *) tensor->data + offset, size);
+
+    if (!slot && tensor->view_src != NULL) {
+        base_tensor = tensor->view_src;
+        base_offset = (size_t) tensor->view_offs;
+        for (size_t i = 0; i < ctx->n_stores; ++i) {
+            if (ctx->stores[i].tensor == base_tensor) {
+                slot = &ctx->stores[i];
+                break;
+            }
+        }
+    }
+
+    if (slot) {
+        if (base_offset + offset + size > slot->size) {
+            memset(data, 0, size);
             return;
         }
-        memset(data, 0, size);
+        memcpy(data, slot->data + base_offset + offset, size);
         return;
     }
 
-    memcpy(data, slot->data + offset, size);
+    if (ggml_aif_nvme_fake_gemv_enabled() &&
+        base_tensor->data != NULL &&
+        ggml_backend_aif_ptr_is_probably_host(base_tensor->data)) {
+        memcpy(data, (const uint8_t *) base_tensor->data + base_offset + offset, size);
+        return;
+    }
+
+    memset(data, 0, size);
 }
 
 static void ggml_backend_aif_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -491,6 +516,11 @@ static enum ggml_status ggml_backend_aif_graph_compute(ggml_backend_t backend, s
                             /* .output_addr       = */ output + tok * n_out,
                             /* .output_dim        = */ (uint32_t) n_out,
                         };
+
+                        if (ggml_aif_nvme_dummy_gemv_enabled()) {
+                            // Simulate device output with deterministic zeros.
+                            memset(output + tok * n_out, 0, output_size);
+                        }
 
                         int rc = nvme_submit_aif_gemv(ctx->fd, &args);
                         if (ggml_backend_aif_debug_gemv_enabled()) {

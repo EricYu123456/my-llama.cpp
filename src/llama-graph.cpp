@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-aif-trace.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -844,6 +845,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     rope_type        (hparams.rope_type),
     sched            (params.sched),
     backend_cpu      (params.backend_cpu),
+    aif_tensor_table (params.aif_tensor_table),
     cvec             (params.cvec),
     loras            (params.loras),
     mctx             (params.mctx),
@@ -873,6 +875,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur) const {
     const char * wname = ggml_get_name(w);
     const bool is_decode_phase = n_tokens == 1;
+    const bool aif_trace_only = llama_aif_trace_only_enabled();
+
+    bool is_qkv_target = false;
+    bool is_ffn_down_target = false;
+    const bool is_aif_target = llama_aif_trace_is_aif_weight(wname, &is_qkv_target, &is_ffn_down_target);
 
     bool weight_on_aif = false;
     if (w->buffer != nullptr) {
@@ -881,7 +888,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     }
 
     ggml_backend_t backend_aif = nullptr;
-    if (sched != nullptr && is_decode_phase) {
+    if (sched != nullptr && is_decode_phase && !aif_trace_only) {
         const int n_backends = ggml_backend_sched_get_n_backends(sched);
         for (int i = 0; i < n_backends; ++i) {
             ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
@@ -894,6 +901,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
     const bool split_ffn_down =
         is_decode_phase &&
+        !aif_trace_only &&
         weight_on_aif &&
         backend_aif != nullptr &&
         wname != nullptr &&
@@ -948,7 +956,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         if (!is_decode_phase) {
             // Prefill is pinned to host execution.
             ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
-        } else if (backend_aif != nullptr && wname != nullptr) {
+        } else if (!aif_trace_only && backend_aif != nullptr && wname != nullptr) {
             const bool is_qkv_proj =
                 strstr(wname, ".attn_q.weight") != nullptr ||
                 strstr(wname, ".attn_k.weight") != nullptr ||
@@ -964,6 +972,37 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
             }
         }
+    }
+
+    if (aif_trace_only && is_decode_phase && is_aif_target) {
+        uint64_t lba_start = 0;
+        uint32_t lba_nblocks = 0;
+        const bool lba_fake = true;
+
+        if (aif_tensor_table && wname != nullptr) {
+            auto it = aif_tensor_table->find(wname);
+            if (it != aif_tensor_table->end()) {
+                lba_start = it->second.start_lba;
+                lba_nblocks = it->second.nblocks;
+            }
+        }
+
+        const int layer_id = llama_aif_trace_layer_id(wname);
+        llama_aif_trace_log_gemv(
+            "decode",
+            wname,
+            layer_id,
+            w->ne[1],
+            w->ne[0],
+            cur->ne[0],
+            w->ne[1],
+            w->type,
+            cur->type,
+            lba_start,
+            lba_nblocks,
+            lba_fake,
+            true,
+            "cpu");
     }
 
     return res;

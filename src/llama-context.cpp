@@ -2092,6 +2092,7 @@ llm_graph_params llama_context::graph_params(
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
+        /*.aif_tensor_table =*/ &model.aif_tensor_table,
         /*.cvec        =*/ &cvec,
         /*.loras       =*/ &loras,
         /*.mctx        =*/ mctx,

@@ -4,6 +4,7 @@
 
 #include "llama-chat.h"
 #include "llama-context.h"
+#include "llama-aif-trace.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -837,7 +838,8 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
     std::vector<llama_model_tensor_buft_override> aif_overrides_merged;
     const char * aif_env = getenv("LLAMA_AIF_ENABLE");
     const bool aif_enabled = aif_env && atoi(aif_env) != 0;
-    if (aif_enabled) {
+    const bool aif_trace_only = llama_aif_trace_only_enabled();
+    if (aif_enabled && !aif_trace_only) {
         ggml_backend_buffer_type_t aif_buft = nullptr;
 
         if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("AIF")) {
@@ -880,6 +882,8 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
                     __func__, n_required, max_overrides);
             }
         }
+    } else if (aif_trace_only) {
+        LLAMA_LOG_INFO("%s: AIF trace-only enabled, keeping CPU/GPU tensor placement\n", __func__);
     }
 
     try {

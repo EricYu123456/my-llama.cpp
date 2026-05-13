@@ -8,6 +8,7 @@ llama_add_compile_flags()
 
 add_library(llama
             ../include/llama.h
+            llama-aif-trace.cpp
             llama.cpp
             llama-adapter.cpp
             llama-arch.cpp

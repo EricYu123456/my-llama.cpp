@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifdef __linux__
 #include <sys/ioctl.h>
@@ -46,6 +47,11 @@ static inline int ggml_aif_nvme_fake_gemv_enabled(void) {
         return env[0] != '0';
     }
     return ggml_aif_nvme_fake_mode_enabled();
+}
+
+static inline int ggml_aif_nvme_dummy_gemv_enabled(void) {
+    const char * env = getenv("GGML_AIF_DUMMY_GEMV");
+    return env != NULL && env[0] != '\0' && env[0] != '0';
 }
 
 static inline void ggml_aif_nvme_fake_trace_post(const struct ggml_aif_post_args * args) {
@@ -111,7 +117,8 @@ static inline int nvme_submit_aif_post(int fd, const struct ggml_aif_post_args *
         return -1;
     }
 
-    struct nvme_passthru_cmd cmd = {0};
+    struct nvme_passthru_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
     cmd.opcode = GGML_AIF_NVME_OPCODE_POST;
     cmd.addr = (uint64_t) (uintptr_t) args->host_addr;
     cmd.data_len = (uint32_t) args->nbytes;
@@ -135,6 +142,11 @@ static inline int nvme_submit_aif_gemv(int fd, const struct ggml_aif_gemv_args *
         return -1;
     }
 
+    if (ggml_aif_nvme_dummy_gemv_enabled()) {
+        ggml_aif_nvme_fake_trace_gemv(args);
+        return 0;
+    }
+
     if (ggml_aif_nvme_fake_gemv_enabled()) {
         ggml_aif_nvme_fake_trace_gemv(args);
         // Return non-zero so backend can run deterministic software fallback.
@@ -145,7 +157,8 @@ static inline int nvme_submit_aif_gemv(int fd, const struct ggml_aif_gemv_args *
         return -1;
     }
 
-    struct nvme_passthru_cmd cmd = {0};
+    struct nvme_passthru_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
     cmd.opcode = GGML_AIF_NVME_OPCODE_GEMV;
     cmd.addr = (uint64_t) (uintptr_t) args->input_addr;
     cmd.data_len = args->input_dim * sizeof(float);

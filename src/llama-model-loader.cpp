@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-aif-nvme.h"
+#include "llama-aif-trace.h"
 
 #include <algorithm>
 #include <array>
@@ -526,10 +527,17 @@ llama_model_loader::llama_model_loader(
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
+    const bool aif_trace_only = llama_aif_trace_only_enabled();
+
     if (const char * aif_env = getenv("LLAMA_AIF_ENABLE")) {
         aif_enabled = atoi(aif_env) != 0;
     }
-    if (aif_enabled) {
+
+    if (aif_trace_only) {
+        aif_enabled = false;
+    }
+
+    if (aif_enabled || aif_trace_only) {
         const bool aif_fake_post = ggml_aif_nvme_fake_mode_enabled();
         const char * dev_path = getenv("GGML_AIF_NVME_PATH");
         if (dev_path == nullptr || dev_path[0] == '\0') {
@@ -540,7 +548,9 @@ llama_model_loader::llama_model_loader(
             aif_next_lba = strtoull(start_lba_env, nullptr, 10);
         }
 
-        if (aif_fake_post) {
+        if (aif_trace_only) {
+            LLAMA_LOG_INFO("%s: AIF trace-only enabled, skipping NVMe device open\n", __func__);
+        } else if (aif_fake_post) {
             LLAMA_LOG_INFO("%s: GGML_AIF_FAKE_POST enabled, skipping NVMe device open and using fake POST path\n", __func__);
         } else {
             aif_fd = open(dev_path, O_RDWR | O_CLOEXEC);
@@ -1114,7 +1124,8 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
-    bool warned_fake_gemv_no_mmap = false;
+    const bool aif_trace_only = llama_aif_trace_only_enabled();
+    bool warned_aif_no_mmap = false;
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
@@ -1136,6 +1147,34 @@ bool llama_model_loader::load_all_data(
             ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(cur->buffer);
             if (buft != nullptr && strcmp(ggml_backend_buft_name(buft), "AIF") == 0) {
                 is_aif_tensor = true;
+            }
+        }
+
+        if (aif_trace_only) {
+            bool is_qkv_target = false;
+            bool is_ffn_down_target = false;
+            if (llama_aif_trace_is_aif_weight(ggml_get_name(cur), &is_qkv_target, &is_ffn_down_target)) {
+                const uint64_t start_lba = aif_next_lba;
+                const uint32_t nblocks = (uint32_t) ((n_size + AIF_BLOCK_SIZE - 1) / AIF_BLOCK_SIZE);
+
+                aif_tensor_table[ggml_get_name(cur)] = llama_aif_lba_info {
+                    /* .start_lba = */ start_lba,
+                    /* .nblocks   = */ nblocks,
+                };
+
+                const int layer_id = llama_aif_trace_layer_id(ggml_get_name(cur));
+                llama_aif_trace_log_post(
+                    "prefill",
+                    ggml_get_name(cur),
+                    layer_id,
+                    cur->ne[1],
+                    cur->ne[0],
+                    cur->type,
+                    start_lba,
+                    nblocks,
+                    true);
+
+                aif_next_lba += nblocks;
             }
         }
 
@@ -1174,22 +1213,17 @@ bool llama_model_loader::load_all_data(
                 /* .nblocks   = */ nblocks,
             };
 
-            if (ggml_aif_nvme_fake_gemv_enabled()) {
-                if (use_mmap) {
-                    // In fake GEMV mode keep the mmap source pointer so software fallback can read weights.
-                    cur->data = (void *) src_ptr;
-                } else if (!warned_fake_gemv_no_mmap) {
-                    LLAMA_LOG_WARN("%s: GGML_AIF_FAKE_GEMV without mmap may not preserve AIF weight sources for fallback GEMV\n", __func__);
-                    warned_fake_gemv_no_mmap = true;
-                    // Store a non-null logical offset in tensor->data for the AIF backend.
-                    // +1 keeps LBA decoding stable via integer division while avoiding null pointers at LBA 0.
-                    cur->data = (void *) (uintptr_t) (start_lba * AIF_BLOCK_SIZE + 1);
-                }
-            } else {
-                // Store a non-null logical offset in tensor->data for the AIF backend.
-                // +1 keeps LBA decoding stable via integer division while avoiding null pointers at LBA 0.
-                cur->data = (void *) (uintptr_t) (start_lba * AIF_BLOCK_SIZE + 1);
+            if (use_mmap) {
+                // Preserve a host-side pointer for scheduler copies while tensor->data stores the LBA.
+                ggml_backend_tensor_set(cur, src_ptr, 0, n_size);
+            } else if (!warned_aif_no_mmap) {
+                LLAMA_LOG_WARN("%s: AIF enabled without mmap may not preserve host weight sources for prefill or fallback GEMV\n", __func__);
+                warned_aif_no_mmap = true;
             }
+
+            // Store a non-null logical offset in tensor->data for the AIF backend.
+            // +1 keeps LBA decoding stable via integer division while avoiding null pointers at LBA 0.
+            cur->data = (void *) (uintptr_t) (start_lba * AIF_BLOCK_SIZE + 1);
             aif_next_lba += nblocks;
 
             size_done += n_size;
