@@ -358,6 +358,25 @@ static bool ggml_backend_aif_debug_gemv_enabled(void) {
     return env != NULL && env[0] != '\0' && env[0] != '0';
 }
 
+static bool ggml_backend_aif_async_enabled(void) {
+    const char * env = getenv("GGML_AIF_ASYNC");
+    if (env != NULL && env[0] != '\0') {
+        return env[0] != '0';
+    }
+    return true;
+}
+
+static bool ggml_backend_aif_tensor_is_aif(const struct ggml_tensor * t) {
+    if (t == NULL) {
+        return false;
+    }
+    ggml_backend_buffer_t buf = t->buffer ? t->buffer : (t->view_src ? t->view_src->buffer : NULL);
+    if (buf == NULL || buf->buft == NULL) {
+        return false;
+    }
+    return strcmp(ggml_backend_buft_name(buf->buft), "AIF") == 0;
+}
+
 // buffer type
 
 static const char * ggml_backend_aif_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -436,6 +455,17 @@ static void ggml_backend_aif_buffer_memset_tensor(
     memset(slot->data + offset, value, size);
 }
 
+static bool ggml_backend_aif_is_weight_tensor(const struct ggml_tensor * tensor) {
+    if (!tensor) {
+        return false;
+    }
+    if (tensor->name[0] != '\0' &&
+        (strstr(tensor->name, ".weight") != NULL || strstr(tensor->name, ".bias") != NULL)) {
+        return true;
+    }
+    return false;
+}
+
 static void ggml_backend_aif_buffer_set_tensor(
         ggml_backend_buffer_t buffer,
         struct ggml_tensor * tensor,
@@ -444,7 +474,8 @@ static void ggml_backend_aif_buffer_set_tensor(
         size_t size) {
     struct ggml_backend_aif_buffer_context * ctx = (struct ggml_backend_aif_buffer_context *) buffer->context;
 
-    if (tensor->op == GGML_OP_NONE &&
+    if (ggml_backend_aif_is_weight_tensor(tensor) &&
+        tensor->op == GGML_OP_NONE &&
         tensor->view_src == NULL &&
         offset == 0 &&
         size == ggml_nbytes(tensor)) {
@@ -462,6 +493,13 @@ static void ggml_backend_aif_buffer_set_tensor(
         slot->data = (uint8_t *) data;
         slot->size = size;
         slot->owns_data = false;
+        if (ggml_backend_aif_debug_gemv_enabled()) {
+            fprintf(stderr, "AIF_DEBUG_WEIGHTS set '%s' ptr=%p size=%zu bytes=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
+                tensor->name, data, size,
+                ((const uint8_t*)data)[0], ((const uint8_t*)data)[1], ((const uint8_t*)data)[2], ((const uint8_t*)data)[3],
+                ((const uint8_t*)data)[4], ((const uint8_t*)data)[5], ((const uint8_t*)data)[6], ((const uint8_t*)data)[7]);
+            fflush(stderr);
+        }
         return;
     }
 
@@ -485,24 +523,19 @@ static void ggml_backend_aif_buffer_get_tensor(
         size_t size) {
     struct ggml_backend_aif_buffer_context * ctx = (struct ggml_backend_aif_buffer_context *) buffer->context;
     struct ggml_backend_aif_tensor_store * slot = NULL;
+
     const struct ggml_tensor * base_tensor = tensor;
     size_t base_offset = 0;
-
-    for (size_t i = 0; i < ctx->n_stores; ++i) {
-        if (ctx->stores[i].tensor == tensor) {
-            slot = &ctx->stores[i];
-            break;
-        }
+    while (base_tensor->view_src != NULL) {
+        base_offset += (size_t) base_tensor->view_offs;
+        base_tensor = base_tensor->view_src;
     }
 
-    if (!slot && tensor->view_src != NULL) {
-        base_tensor = tensor->view_src;
-        base_offset = (size_t) tensor->view_offs;
-        for (size_t i = 0; i < ctx->n_stores; ++i) {
-            if (ctx->stores[i].tensor == base_tensor) {
-                slot = &ctx->stores[i];
-                break;
-            }
+    for (size_t i = 0; i < ctx->n_stores; ++i) {
+        if (ctx->stores[i].tensor == base_tensor ||
+            (base_tensor->name[0] != '\0' && strcmp(ctx->stores[i].tensor->name, base_tensor->name) == 0)) {
+            slot = &ctx->stores[i];
+            break;
         }
     }
 
@@ -511,8 +544,13 @@ static void ggml_backend_aif_buffer_get_tensor(
             memset(data, 0, size);
             return;
         }
+        // No verbose logging here to prevent huge logs and slow execution
         memcpy(data, slot->data + base_offset + offset, size);
         return;
+    } else {
+        fprintf(stderr, "AIF_DEBUG: slot NOT found for tensor '%s' (base_tensor='%s', base_offset=%zu)\n",
+            tensor->name, base_tensor->name, base_offset);
+        fflush(stderr);
     }
 
     if (ggml_aif_nvme_fake_gemv_enabled() &&
@@ -654,6 +692,13 @@ static bool ggml_backend_aif_software_gemv(
         }
 
         output[row] = ggml_backend_aif_dot_f32(row_data, input, n_cols);
+        if (ggml_backend_aif_debug_gemv_enabled() && row == 0 && strcmp(w->name, "blk.0.attn_q.weight") == 0) {
+            fprintf(stderr, "AIF_GEMV_DEBUG name=%s row=0 input=[%f %f %f %f] row_data=[%f %f %f %f] out=%f\n",
+                w->name, input[0], input[1], input[2], input[3],
+                row_data[0], row_data[1], row_data[2], row_data[3],
+                output[0]);
+            fflush(stderr);
+        }
     }
 
     free(row_f32);
@@ -663,7 +708,7 @@ static bool ggml_backend_aif_software_gemv(
 
 static enum ggml_status ggml_backend_aif_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_aif_context * ctx = (struct ggml_backend_aif_context *) backend->context;
-    const bool async_enabled = ctx && ctx->worker_started;
+    const bool async_enabled = ctx && ctx->worker_started && ggml_backend_aif_async_enabled();
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         struct ggml_tensor * node = cgraph->nodes[i];
@@ -876,12 +921,24 @@ static ggml_backend_buffer_type_t ggml_backend_aif_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_aif_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    return op->op == GGML_OP_MUL_MAT ||
-           op->op == GGML_OP_NONE ||
-           op->op == GGML_OP_RESHAPE ||
-           op->op == GGML_OP_VIEW ||
-           op->op == GGML_OP_PERMUTE ||
-           op->op == GGML_OP_TRANSPOSE;
+    if (op == NULL) {
+        return false;
+    }
+
+    if (op->op == GGML_OP_MUL_MAT) {
+        // Only accept MUL_MAT when the weight tensor lives in the AIF buffer.
+        return ggml_backend_aif_tensor_is_aif(op->src[0]);
+    }
+
+    if (op->op == GGML_OP_NONE ||
+        op->op == GGML_OP_RESHAPE ||
+        op->op == GGML_OP_VIEW ||
+        op->op == GGML_OP_PERMUTE ||
+        op->op == GGML_OP_TRANSPOSE) {
+        return ggml_backend_aif_tensor_is_aif(op);
+    }
+
+    return false;
 }
 
 static bool ggml_backend_aif_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
