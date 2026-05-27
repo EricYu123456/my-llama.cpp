@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,9 +31,231 @@ struct ggml_backend_aif_buffer_context {
     size_t cap_stores;
 };
 
+struct ggml_backend_aif_job;
+
+static bool ggml_backend_aif_debug_gemv_enabled(void);
+static bool ggml_backend_aif_software_gemv(const struct ggml_tensor * w, const float * input, float * output);
+
 struct ggml_backend_aif_context {
     int fd;
+    pthread_t worker;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_cond_t idle;
+    struct ggml_backend_aif_job * head;
+    struct ggml_backend_aif_job * tail;
+    int pending;
+    bool stop;
+    bool worker_started;
 };
+
+struct ggml_backend_aif_job {
+    struct ggml_backend_aif_job * next;
+    struct ggml_tensor * node;
+    struct ggml_tensor * w;
+    struct ggml_tensor * x;
+    int64_t n_tokens;
+    int64_t n_out;
+    int64_t input_dim;
+    uint64_t lba_start;
+    uint32_t nblocks;
+};
+
+static void ggml_backend_aif_job_free(struct ggml_backend_aif_job * job) {
+    if (!job) {
+        return;
+    }
+    free(job);
+}
+
+static void ggml_backend_aif_job_execute(struct ggml_backend_aif_context * ctx, struct ggml_backend_aif_job * job) {
+    if (!job || !job->node || !job->w || !job->x) {
+        return;
+    }
+
+    const bool debug = ggml_backend_aif_debug_gemv_enabled();
+
+    const size_t input_size = (size_t) job->input_dim * sizeof(float);
+    const size_t input_size_total = input_size * (size_t) job->n_tokens;
+    const size_t output_size = (size_t) job->n_out * sizeof(float);
+    const size_t output_size_total = output_size * (size_t) job->n_tokens;
+
+    float * input_all = (float *) malloc(input_size_total);
+    float * output = (float *) calloc(1, output_size_total);
+    if (!output) {
+        free(input_all);
+        return;
+    }
+    if (!input_all) {
+        memset(output, 0, output_size_total);
+        ggml_backend_tensor_set(job->node, output, 0, output_size_total);
+        free(output);
+        return;
+    }
+
+    ggml_backend_tensor_get(job->x, input_all, 0, input_size_total);
+
+    float * input = (float *) malloc(input_size);
+    if (!input) {
+        memset(output, 0, output_size_total);
+        ggml_backend_tensor_set(job->node, output, 0, output_size_total);
+        free(input_all);
+        free(output);
+        return;
+    }
+
+    for (int64_t tok = 0; tok < job->n_tokens; ++tok) {
+        memcpy(input, input_all + tok * job->input_dim, input_size);
+
+        struct ggml_aif_gemv_args args = {
+            /* .input_dim         = */ (uint32_t) job->input_dim,
+            /* .input_addr        = */ input,
+            /* .matrix_start_lba  = */ job->lba_start,
+            /* .matrix_nblocks    = */ job->nblocks,
+            /* .output_addr       = */ output + tok * job->n_out,
+            /* .output_dim        = */ (uint32_t) job->n_out,
+        };
+
+        if (ggml_aif_nvme_dummy_gemv_enabled()) {
+            // Simulate device output with deterministic zeros.
+            memset(output + tok * job->n_out, 0, output_size);
+        }
+
+        int rc = nvme_submit_aif_gemv(ctx->fd, &args);
+        if (debug) {
+            GGML_LOG_INFO("AIF_GEMV_DEBUG submit name=%s tok=%lld rc=%d\n", job->node->name, (long long) tok, rc);
+        }
+        if (rc != 0) {
+            if (ggml_aif_nvme_fake_gemv_enabled()) {
+                if (!ggml_backend_aif_software_gemv(job->w, input, output + tok * job->n_out)) {
+                    memset(output + tok * job->n_out, 0, output_size);
+                }
+            } else {
+                // Keep a deterministic fallback output when the simulator path is not available.
+                memset(output + tok * job->n_out, 0, output_size);
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(job->node, output, 0, output_size_total);
+    free(input);
+    free(input_all);
+    free(output);
+}
+
+static void * ggml_backend_aif_worker_main(void * arg) {
+    struct ggml_backend_aif_context * ctx = (struct ggml_backend_aif_context *) arg;
+    for (;;) {
+        pthread_mutex_lock(&ctx->mutex);
+        while (!ctx->stop && ctx->head == NULL) {
+            pthread_cond_wait(&ctx->cond, &ctx->mutex);
+        }
+
+        if (ctx->stop && ctx->head == NULL) {
+            pthread_mutex_unlock(&ctx->mutex);
+            break;
+        }
+
+        struct ggml_backend_aif_job * job = ctx->head;
+        ctx->head = job->next;
+        if (ctx->head == NULL) {
+            ctx->tail = NULL;
+        }
+        pthread_mutex_unlock(&ctx->mutex);
+
+        ggml_backend_aif_job_execute(ctx, job);
+        ggml_backend_aif_job_free(job);
+
+        pthread_mutex_lock(&ctx->mutex);
+        ctx->pending--;
+        if (ctx->pending == 0) {
+            pthread_cond_signal(&ctx->idle);
+        }
+        pthread_mutex_unlock(&ctx->mutex);
+    }
+
+    return NULL;
+}
+
+static bool ggml_backend_aif_worker_start(struct ggml_backend_aif_context * ctx) {
+    if (pthread_mutex_init(&ctx->mutex, NULL) != 0) {
+        return false;
+    }
+    if (pthread_cond_init(&ctx->cond, NULL) != 0) {
+        pthread_mutex_destroy(&ctx->mutex);
+        return false;
+    }
+    if (pthread_cond_init(&ctx->idle, NULL) != 0) {
+        pthread_cond_destroy(&ctx->cond);
+        pthread_mutex_destroy(&ctx->mutex);
+        return false;
+    }
+
+    ctx->head = NULL;
+    ctx->tail = NULL;
+    ctx->pending = 0;
+    ctx->stop = false;
+
+    if (pthread_create(&ctx->worker, NULL, ggml_backend_aif_worker_main, ctx) != 0) {
+        pthread_cond_destroy(&ctx->idle);
+        pthread_cond_destroy(&ctx->cond);
+        pthread_mutex_destroy(&ctx->mutex);
+        return false;
+    }
+
+    ctx->worker_started = true;
+    return true;
+}
+
+static void ggml_backend_aif_worker_stop(struct ggml_backend_aif_context * ctx) {
+    if (!ctx->worker_started) {
+        return;
+    }
+
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->stop = true;
+    pthread_cond_signal(&ctx->cond);
+    pthread_mutex_unlock(&ctx->mutex);
+
+    pthread_join(ctx->worker, NULL);
+    pthread_cond_destroy(&ctx->idle);
+    pthread_cond_destroy(&ctx->cond);
+    pthread_mutex_destroy(&ctx->mutex);
+
+    ctx->worker_started = false;
+}
+
+static bool ggml_backend_aif_enqueue_job(struct ggml_backend_aif_context * ctx, struct ggml_backend_aif_job * job) {
+    pthread_mutex_lock(&ctx->mutex);
+    if (ctx->stop) {
+        pthread_mutex_unlock(&ctx->mutex);
+        return false;
+    }
+    job->next = NULL;
+    if (ctx->tail) {
+        ctx->tail->next = job;
+    } else {
+        ctx->head = job;
+    }
+    ctx->tail = job;
+    ctx->pending++;
+    pthread_cond_signal(&ctx->cond);
+    pthread_mutex_unlock(&ctx->mutex);
+    return true;
+}
+
+static void ggml_backend_aif_synchronize(ggml_backend_t backend) {
+    struct ggml_backend_aif_context * ctx = (struct ggml_backend_aif_context *) backend->context;
+    if (!ctx || !ctx->worker_started) {
+        return;
+    }
+
+    pthread_mutex_lock(&ctx->mutex);
+    while (ctx->pending > 0) {
+        pthread_cond_wait(&ctx->idle, &ctx->mutex);
+    }
+    pthread_mutex_unlock(&ctx->mutex);
+}
 
 static void ggml_backend_aif_store_clear(struct ggml_backend_aif_buffer_context * ctx) {
     for (size_t i = 0; i < ctx->n_stores; ++i) {
@@ -364,6 +587,8 @@ static const char * ggml_backend_aif_get_name(ggml_backend_t backend) {
 static void ggml_backend_aif_free(ggml_backend_t backend) {
     struct ggml_backend_aif_context * ctx = (struct ggml_backend_aif_context *) backend->context;
     if (ctx) {
+        ggml_backend_aif_synchronize(backend);
+        ggml_backend_aif_worker_stop(ctx);
         if (ctx->fd >= 0) {
             close(ctx->fd);
         }
@@ -438,6 +663,7 @@ static bool ggml_backend_aif_software_gemv(
 
 static enum ggml_status ggml_backend_aif_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_aif_context * ctx = (struct ggml_backend_aif_context *) backend->context;
+    const bool async_enabled = ctx && ctx->worker_started;
 
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         struct ggml_tensor * node = cgraph->nodes[i];
@@ -475,6 +701,9 @@ static enum ggml_status ggml_backend_aif_graph_compute(ggml_backend_t backend, s
                         if (ggml_backend_aif_debug_gemv_enabled()) {
                             GGML_LOG_INFO("AIF_GEMV_DEBUG skip_non_f32 name=%s\n", node->name);
                         }
+                        if (async_enabled) {
+                            ggml_backend_aif_synchronize(backend);
+                        }
                         return GGML_STATUS_FAILED;
                     }
 
@@ -482,70 +711,43 @@ static enum ggml_status ggml_backend_aif_graph_compute(ggml_backend_t backend, s
                         if (ggml_backend_aif_debug_gemv_enabled()) {
                             GGML_LOG_INFO("AIF_GEMV_DEBUG skip_shape_mismatch name=%s\n", node->name);
                         }
+                        if (async_enabled) {
+                            ggml_backend_aif_synchronize(backend);
+                        }
                         return GGML_STATUS_FAILED;
                     }
-
-                    const size_t input_size = (size_t) x->ne[0] * sizeof(float);
-                    const size_t input_size_total = input_size * (size_t) n_tokens;
-                    const size_t output_size = (size_t) n_out * sizeof(float);
-                    const size_t output_size_total = output_size * (size_t) n_tokens;
-                    float * input = (float *) malloc(input_size);
-                    float * input_all = (float *) malloc(input_size_total);
-                    float * output = (float *) calloc(1, output_size_total);
-                    if (!input || !input_all || !output) {
-                        free(input);
-                        free(input_all);
-                        free(output);
-                        return GGML_STATUS_ALLOC_FAILED;
-                    }
-
-                    ggml_backend_tensor_get(x, input_all, 0, input_size_total);
 
                     const uintptr_t offs = (uintptr_t) w->data;
                     const uint64_t lba_start = offs / GGML_AIF_BLOCK_SIZE;
                     const uint32_t nblocks = (uint32_t) ((ggml_nbytes(w) + GGML_AIF_BLOCK_SIZE - 1) / GGML_AIF_BLOCK_SIZE);
 
-                    for (int64_t tok = 0; tok < n_tokens; ++tok) {
-                        memcpy(input, input_all + tok * x->ne[0], input_size);
-
-                        struct ggml_aif_gemv_args args = {
-                            /* .input_dim         = */ (uint32_t) x->ne[0],
-                            /* .input_addr        = */ input,
-                            /* .matrix_start_lba  = */ lba_start,
-                            /* .matrix_nblocks    = */ nblocks,
-                            /* .output_addr       = */ output + tok * n_out,
-                            /* .output_dim        = */ (uint32_t) n_out,
-                        };
-
-                        if (ggml_aif_nvme_dummy_gemv_enabled()) {
-                            // Simulate device output with deterministic zeros.
-                            memset(output + tok * n_out, 0, output_size);
+                    struct ggml_backend_aif_job * job = (struct ggml_backend_aif_job *) calloc(1, sizeof(struct ggml_backend_aif_job));
+                    if (!job) {
+                        if (async_enabled) {
+                            ggml_backend_aif_synchronize(backend);
                         }
-
-                        int rc = nvme_submit_aif_gemv(ctx->fd, &args);
-                        if (ggml_backend_aif_debug_gemv_enabled()) {
-                            GGML_LOG_INFO("AIF_GEMV_DEBUG submit name=%s tok=%lld rc=%d\n", node->name, (long long) tok, rc);
-                        }
-                        if (rc != 0) {
-                            if (ggml_aif_nvme_fake_gemv_enabled()) {
-                                if (!ggml_backend_aif_software_gemv(w, input, output + tok * n_out)) {
-                                    free(input);
-                                    free(input_all);
-                                    free(output);
-                                    return GGML_STATUS_FAILED;
-                                }
-                            } else {
-                                // Keep a deterministic fallback output when the simulator path is not available.
-                                memset(output + tok * n_out, 0, output_size);
-                            }
-                        }
+                        return GGML_STATUS_ALLOC_FAILED;
                     }
 
-                    ggml_backend_tensor_set(node, output, 0, output_size_total);
+                    job->node = node;
+                    job->w = w;
+                    job->x = x;
+                    job->n_tokens = n_tokens;
+                    job->n_out = n_out;
+                    job->input_dim = x->ne[0];
+                    job->lba_start = lba_start;
+                    job->nblocks = nblocks;
 
-                    free(input);
-                    free(input_all);
-                    free(output);
+                    if (async_enabled) {
+                        if (!ggml_backend_aif_enqueue_job(ctx, job)) {
+                            ggml_backend_aif_job_free(job);
+                            ggml_backend_aif_synchronize(backend);
+                            return GGML_STATUS_FAILED;
+                        }
+                    } else {
+                        ggml_backend_aif_job_execute(ctx, job);
+                        ggml_backend_aif_job_free(job);
+                    }
                 }
                 break;
             case GGML_OP_NONE:
@@ -555,6 +757,9 @@ static enum ggml_status ggml_backend_aif_graph_compute(ggml_backend_t backend, s
             case GGML_OP_TRANSPOSE:
                 break;
             default:
+                if (async_enabled) {
+                    ggml_backend_aif_synchronize(backend);
+                }
                 return GGML_STATUS_FAILED;
         }
     }
@@ -568,7 +773,7 @@ static const struct ggml_backend_i ggml_backend_aif_i = {
     /* .set_tensor_async   = */ NULL,
     /* .get_tensor_async   = */ NULL,
     /* .cpy_tensor_async   = */ NULL,
-    /* .synchronize        = */ NULL,
+    /* .synchronize        = */ ggml_backend_aif_synchronize,
     /* .graph_plan_create  = */ NULL,
     /* .graph_plan_free    = */ NULL,
     /* .graph_plan_update  = */ NULL,
@@ -595,6 +800,10 @@ ggml_backend_t ggml_backend_aif_init(void) {
         dev_path = "/dev/nvme0n1";
     }
     ctx->fd = open(dev_path, O_RDWR | O_CLOEXEC);
+
+    if (!ggml_backend_aif_worker_start(ctx)) {
+        GGML_LOG_WARN("%s: failed to start AIF worker thread, using synchronous GEMV\n", __func__);
+    }
 
     ggml_backend_t backend = (ggml_backend_t) calloc(1, sizeof(struct ggml_backend));
     if (!backend) {
@@ -648,7 +857,7 @@ static void ggml_backend_aif_device_get_props(ggml_backend_dev_t dev, struct ggm
     props->memory_total = 0;
     props->type = GGML_BACKEND_DEVICE_TYPE_ACCEL;
     props->device_id = NULL;
-    props->caps.async = false;
+    props->caps.async = true;
     props->caps.host_buffer = false;
     props->caps.buffer_from_host_ptr = false;
     props->caps.events = false;

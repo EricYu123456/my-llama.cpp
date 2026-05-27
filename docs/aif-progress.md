@@ -4,6 +4,7 @@
 - NVMe ioctl wrappers for aif_post and aif_gemv.
 - ggml-aif backend buffer type (virtual buffer) with LBA pointer hijacking.
 - GGML_OP_MUL_MAT offload hook in AIF backend.
+- Host-side non-blocking GEMV via worker thread (simulated async).
 - Tensor table mapping from tensor name to LBA range during model load.
 - AIF tensor buffer overrides for QKV and ffn_down when AIF is enabled.
 - Prefill pinned to host; decode allows AIF scheduling.
@@ -13,6 +14,7 @@
 - Add JSONL logging for real NVMe ioctl path.
 - Support non-F32 input and output types in AIF GEMV.
 - Extend FFN split beyond ffn_down and handle LoRA cases.
+- True async NVMe I/O path (driver/io_uring) with completion events.
 
 ## Test Commands
 
@@ -51,3 +53,4 @@ LLAMA_AIF_START_LBA=0 \
 - Trace-only mode does not offload; it only logs intended AIF commands.
 - FFN split only for ffn_down in decode phase, requires AIF weights and no LoRA.
 - AIF weight host pointers are preserved only with mmap enabled.
+- Non-blocking is thread-simulated; NVMe ioctl remains synchronous.
