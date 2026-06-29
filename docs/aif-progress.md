@@ -44,6 +44,7 @@ LLAMA_AIF_START_LBA=0 \
 LLAMA_AIF_ENABLE=1 \
 GGML_AIF_NVME_PATH=/dev/nvme0n1 \
 LLAMA_AIF_START_LBA=0 \
+GGML_AIF_FAKE_PIPELINE=128 \
 ./build/bin/llama-cli -m qwen2-57b-a14b-instruct-q3_k_m.gguf \
 	-p "test" -n 32 --no-warmup -ngl 0 --mmap
 ```

@@ -116,6 +116,23 @@ static void ggml_backend_aif_job_execute(struct ggml_backend_aif_context * ctx, 
             /* .output_dim        = */ (uint32_t) job->n_out,
         };
 
+        const char * fake_pipe_env = getenv("GGML_AIF_FAKE_PIPELINE");
+        if (fake_pipe_env) {
+            int fake_pipe_val = atoi(fake_pipe_env);
+            if (fake_pipe_val > 0) {
+                if (job->w->name[0] != '\0' && (strstr(job->w->name, "attn_q") || strstr(job->w->name, "attn_k") || strstr(job->w->name, "attn_v") || strstr(job->w->name, "attn_qkv"))) {
+                    uint32_t head_size = (fake_pipe_val == 1) ? 128 : (uint32_t)fake_pipe_val;
+                    if (args.output_dim > head_size) {
+                        args.matrix_nblocks = (uint32_t)(((uint64_t)args.matrix_nblocks * head_size) / args.output_dim);
+                        if (args.matrix_nblocks == 0) {
+                            args.matrix_nblocks = 1;
+                        }
+                        args.output_dim = head_size;
+                    }
+                }
+            }
+        }
+
         if (ggml_aif_nvme_dummy_gemv_enabled()) {
             // Simulate device output with deterministic zeros.
             memset(output + tok * job->n_out, 0, output_size);
